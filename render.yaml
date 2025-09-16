@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: reimburse-backend
+    env: node
+    plan: starter
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DB_PATH
+        value: /data/database.sqlite
+      - key: UPLOAD_DIR
+        value: /data/uploads
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: GOOGLE_CREDENTIALS
+        sync: false
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1

@@ -1,0 +1,17 @@
+# Dependencies & OS clutter
+node_modules
+.DS_Store
+*.log
+
+# Local runtime data
+uploads
+database.sqlite
+database.sqlite*
+# Env (never commit)
+.env
+.env.*
+
+# Secrets (never commit)
+service-account.json
+*.secret.json
+!.env.example
