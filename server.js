@@ -1,253 +1,411 @@
-/**
- * Reimburse backend – Express + SQLite + JWT
- * ==========================================
- *  - Login:         POST /api/auth/login  -> { token, user }
- *  - Current user:  GET  /api/auth/me     -> { user }
- *  - Expenses:      GET  /api/expenses    -> [ ... ]
- *  - Health:        GET  /health          -> { ok: true }
- *
- * CORS:
- *  - Set CORS_ORIGINS in env as comma separated list:
- *      CORS_ORIGINS="https://brown-mouse-202848.hostingersite.com,http://localhost:5500"
- */
+/* eslint-disable no-console */
+require('dotenv').config();
 
-const express = require('express');
-const cors = require('cors');
-const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const multer = require('multer');
+const jwt = require('jsonwebtoken');
 const sqlite3 = require('sqlite3').verbose();
 
+/* -------------------------------------------------------
+   BASIC APP
+------------------------------------------------------- */
 const app = express();
-app.use(express.json());
+app.use(helmet());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-// ----------------------
-// ENV & constants
-// ----------------------
-const PORT = process.env.PORT || 10000;
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+/* -------------------------------------------------------
+   CORS (accepts CORS_ORIGINS or ALLOWED_ORIGINS)
+------------------------------------------------------- */
+const envOrigins =
+  process.env.CORS_ORIGINS ||
+  process.env.ALLOWED_ORIGINS ||
+  '';
 
-// Allowed origins for CORS, configured via env
-const allowedOrigins = (process.env.CORS_ORIGINS || '')
+const allowedOrigins = envOrigins
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
+const defaultAllowed = [
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000'
+];
+
+const ORIGINS = allowedOrigins.length ? allowedOrigins : defaultAllowed;
+
+function corsOrigin(origin, cb) {
+  // No-origin (curl, Postman, same-host SSR) -> allow
+  if (!origin) return cb(null, true);
+
+  const ok = ORIGINS.includes(origin);
+  if (!ok) {
+    console.log('[CORS] Blocked:', origin, '| Allowed:', ORIGINS);
+  }
+  return cb(ok ? null : new Error('Origin not allowed'), ok);
+}
+
 const corsOptions = {
-  origin: (origin, cb) => {
-    // Allow server-to-server or curl (no origin)
-    if (!origin) return cb(null, true);
-    const ok = allowedOrigins.includes(origin);
-    cb(ok ? null : new Error('Origin not allowed'), ok);
-  },
+  origin: corsOrigin,
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
   optionsSuccessStatus: 204
 };
 
+// CORS must be before routes
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-// Help caches vary per origin
+app.options('*', cors(corsOptions));      // preflight for all routes
 app.use((req, res, next) => {
-  res.header('Vary', 'Origin');
+  res.header('Vary', 'Origin');           // help caches/CDNs
   next();
 });
 
-// ----------------------
-// SQLite setup
-// ----------------------
-const DB_FILE = path.join(__dirname, 'database.sqlite');
-if (!fs.existsSync(DB_FILE)) {
-  fs.closeSync(fs.openSync(DB_FILE, 'w'));
-}
+/* -------------------------------------------------------
+   DB (SQLite)
+------------------------------------------------------- */
+const DB_FILE = path.resolve(__dirname, 'database.sqlite');
 const db = new sqlite3.Database(DB_FILE);
 
-function run(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
-      if (err) reject(err);
-      else resolve(this);
-    });
-  });
-}
-
-function all(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, function (err, rows) {
-      if (err) reject(err);
-      else resolve(rows);
-    });
-  });
-}
-
-function get(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, function (err, row) {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
-}
-
-// Create tables
-async function initDb() {
-  await run(`
+// Init tables if not exists
+db.serialize(() => {
+  db.run(`
     CREATE TABLE IF NOT EXISTS Users (
       id TEXT PRIMARY KEY,
       name TEXT UNIQUE,
-      password TEXT,
       role TEXT,
-      email TEXT
+      password TEXT
     )
   `);
-
-  await run(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS Expenses (
       id TEXT PRIMARY KEY,
       title TEXT,
       category TEXT,
-      amount REAL,
+      amount INTEGER,
       currency TEXT,
       date TEXT,
-      employeeId TEXT,
+      entryDate TEXT,
       note TEXT,
+      mgrStatus TEXT,
+      acctStatus TEXT,
+      paid INTEGER,
       receiptPath TEXT,
       receiptName TEXT,
       receiptMime TEXT,
-      mgrStatus TEXT DEFAULT 'Pending',
-      acctStatus TEXT DEFAULT 'Pending',
-      paid INTEGER DEFAULT 0,
-      createdAt TEXT DEFAULT (datetime('now')),
-      updatedAt TEXT DEFAULT (datetime('now'))
+      createdAt TEXT,
+      updatedAt TEXT,
+      employeeId TEXT,
+      FOREIGN KEY (employeeId) REFERENCES Users(id)
     )
   `);
 
-  // Seed users if not exists
-  const count = await get(`SELECT COUNT(*) as c FROM Users`);
-  if (!count || count.c === 0) {
-    const users = [
-      { id: crypto.randomUUID(), name: 'admin',      password: 'password123', role: 'admin',      email: 'admin@company.local' },
-      { id: crypto.randomUUID(), name: 'manager',    password: 'password123', role: 'manager',    email: 'manager@company.local' },
-      { id: crypto.randomUUID(), name: 'accountant', password: 'password123', role: 'accountant', email: 'accountant@company.local' },
-      { id: crypto.randomUUID(), name: 'alice',      password: 'password123', role: 'employee',   email: 'alice@company.local' }
-    ];
-    for (const u of users) {
-      await run(
-        `INSERT INTO Users (id, name, password, role, email) VALUES (?, ?, ?, ?, ?)`,
-        [u.id, u.name, u.password, u.role, u.email]
+  // Seed default users if empty
+  db.get(`SELECT COUNT(*) AS c FROM Users`, (err, row) => {
+    if (err) return console.error(err);
+    if (row.c === 0) {
+      const stmt = db.prepare(
+        `INSERT INTO Users (id, name, role, password) VALUES (?, ?, ?, ?)`
+      );
+      const users = [
+        ['aea85505-50f0-4bdf-adf7-3b919a88fc9d', 'admin', 'admin', 'password123'],
+        ['c379b904-84f8-4b31-9324-d3f3bf378946', 'manager', 'manager', 'password123'],
+        ['c7cc2685-1786-4cf3-bd95-ce829a911019', 'accountant', 'accountant', 'password123'],
+        ['c7e86224-9251-4d6d-a8c5-7ad33dfe0fb1', 'alice', 'employee', 'password123']
+      ];
+      users.forEach(u => stmt.run(u));
+      stmt.finalize(() =>
+        console.log('Seeded users: admin/manager/accountant/alice with password: password123')
       );
     }
-    console.log('Seeded users: admin/manager/accountant/alice with password: password123');
+  });
+});
+
+/* -------------------------------------------------------
+   FILE UPLOADS
+------------------------------------------------------- */
+const UPLOAD_DIR = path.resolve(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+
+const storage = multer.diskStorage({
+  destination: (_, __, cb) => cb(null, UPLOAD_DIR),
+  filename: (_, file, cb) => {
+    const ts = Date.now();
+    const safe = file.originalname.replace(/[^\w.\-]+/g, '_');
+    cb(null, `${ts}_${safe}`);
   }
-}
+});
+const upload = multer({ storage });
 
-// ----------------------
-// Auth helpers
-// ----------------------
+/* -------------------------------------------------------
+   AUTH
+------------------------------------------------------- */
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_only_change_me';
+
 function signToken(user) {
-  // NEVER put the password inside token
-  const payload = {
-    user: {
-      id: user.id,
-      name: user.name,
-      role: user.role,
-      email: user.email
-    }
-  };
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign(
+    { sub: user.id, name: user.name, role: user.role },
+    JWT_SECRET,
+    { expiresIn: '8h' }
+  );
 }
 
-function authRequired(req, res, next) {
-  const auth = req.headers.authorization || '';
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  if (!m) return res.status(401).json({ error: 'Missing or malformed Authorization header' });
-
+function auth(req, res, next) {
+  const hdr = req.headers.authorization || '';
+  const m = hdr.match(/^Bearer\s+(.+)$/i);
+  if (!m) return res.status(401).json({ error: 'Missing token' });
   try {
-    const payload = jwt.verify(m[1], JWT_SECRET);
-    req.user = payload.user || payload;
+    req.user = jwt.verify(m[1], JWT_SECRET);
     next();
   } catch (e) {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
 
-// ----------------------
-// Routes
-// ----------------------
-
-// Health
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-// Login
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { name, password } = req.body || {};
-    if (!name || !password) {
-      return res.status(400).json({ error: 'name and password are required' });
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Unauthenticated' });
+    if (!roles.includes(req.user.role) && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
     }
-    const user = await get(`SELECT * FROM Users WHERE name = ?`, [name]);
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-    // Plain-text passwords only for demo (DO NOT use in production)
-    if (user.password !== password) {
+    next();
+  };
+}
+
+/* -------------------------------------------------------
+   ROUTES: AUTH
+------------------------------------------------------- */
+// POST /api/auth/login { name, password }
+app.post('/api/auth/login', (req, res) => {
+  const { name, password } = req.body || {};
+  if (!name || !password) {
+    return res.status(400).json({ error: 'Missing credentials' });
+  }
+  db.get(`SELECT * FROM Users WHERE name = ?`, [name], (err, user) => {
+    if (err) return res.status(500).json({ error: 'DB error' });
+    if (!user || user.password !== password) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     const token = signToken(user);
-    return res.json({
+    res.json({
       token,
-      user: { id: user.id, name: user.name, role: user.role, email: user.email }
+      user: { id: user.id, name: user.name, role: user.role }
     });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Login failed' });
-  }
-});
-
-// Current user
-app.get('/api/auth/me', authRequired, (req, res) => {
-  res.json({ user: req.user });
-});
-
-// Expenses list
-// - admin/manager/accountant: all expenses
-// - employee: only own expenses
-app.get('/api/expenses', authRequired, async (req, res) => {
-  try {
-    const role = req.user.role;
-    let rows;
-    if (role === 'employee') {
-      rows = await all(
-        `SELECT e.*, u.name as employeeName FROM Expenses e
-         LEFT JOIN Users u ON u.id = e.employeeId
-         WHERE employeeId = ? ORDER BY createdAt DESC`,
-        [req.user.id]
-      );
-    } else {
-      rows = await all(
-        `SELECT e.*, u.name as employeeName FROM Expenses e
-         LEFT JOIN Users u ON u.id = e.employeeId
-         ORDER BY createdAt DESC`
-      );
-    }
-    res.json(rows || []);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Failed to fetch expenses' });
-  }
-});
-
-// Return JSON 404 for unknown API routes
-app.use('/api', (req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
-// ----------------------
-// Start
-// ----------------------
-initDb().then(() => {
-  app.listen(PORT, () => {
-    console.log(`Server started on http://localhost:${PORT}`);
-    console.log('Available at your primary URL on Render.');
   });
 });
+
+// GET /api/auth/me
+app.get('/api/auth/me', auth, (req, res) => {
+  db.get(`SELECT id, name, role FROM Users WHERE id = ?`, [req.user.sub], (err, user) => {
+    if (err) return res.status(500).json({ error: 'DB error' });
+    if (!user) return res.status(404).json({ error: 'Not found' });
+    res.json({ user });
+  });
+});
+
+/* -------------------------------------------------------
+   ROUTES: EXPENSES
+------------------------------------------------------- */
+// GET /api/expenses
+// - employee -> own
+// - manager/accountant/admin -> all
+app.get('/api/expenses', auth, (req, res) => {
+  if (req.user.role === 'employee') {
+    db.all(
+      `SELECT e.*, u.name as employeeName, u.email as email
+         FROM Expenses e
+         LEFT JOIN Users u ON u.id = e.employeeId
+        WHERE employeeId = ?
+        ORDER BY datetime(createdAt) DESC`,
+      [req.user.sub],
+      (err, rows) => err ? res.status(500).json({ error: 'DB error' }) : res.json(rows || [])
+    );
+  } else {
+    db.all(
+      `SELECT e.*, u.name as employeeName
+         FROM Expenses e
+         LEFT JOIN Users u ON u.id = e.employeeId
+        ORDER BY datetime(createdAt) DESC`,
+      [],
+      (err, rows) => err ? res.status(500).json({ error: 'DB error' }) : res.json(rows || [])
+    );
+  }
+});
+
+// POST /api/expenses (employee creates)
+// multipart/form-data with "receipt" optional
+app.post('/api/expenses', auth, upload.single('receipt'), (req, res) => {
+  const { title, category, amount, currency, date, note } = req.body || {};
+  if (!title || !category || !amount || !currency || !date) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+
+  const now = new Date().toISOString();
+  const id = require('crypto').randomUUID();
+
+  const receiptPath = req.file ? `/uploads/${req.file.filename}` : null;
+  const receiptName = req.file ? req.file.originalname : null;
+  const receiptMime = req.file ? req.file.mimetype : null;
+
+  const stmt = `
+    INSERT INTO Expenses (
+      id, title, category, amount, currency, date, entryDate, note,
+      mgrStatus, acctStatus, paid,
+      receiptPath, receiptName, receiptMime,
+      createdAt, updatedAt, employeeId
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 'Pending', 0, ?, ?, ?, ?, ?, ?)
+  `;
+
+  db.run(
+    stmt,
+    [
+      id, title, category, parseInt(amount, 10), currency, date, null, note || '',
+      receiptPath, receiptName, receiptMime,
+      now, now, req.user.sub
+    ],
+    function (err) {
+      if (err) return res.status(500).json({ error: 'DB error' });
+      db.get(`SELECT * FROM Expenses WHERE id = ?`, [id], (e2, row) => {
+        if (e2) return res.status(500).json({ error: 'DB error' });
+        res.status(201).json(row);
+      });
+    }
+  );
+});
+
+// PATCH /api/expenses/:id/manager {status: 'Accepted'|'Declined'}
+app.patch(
+  '/api/expenses/:id/manager',
+  auth,
+  requireRole('manager'),
+  (req, res) => {
+    const { status } = req.body || {};
+    if (!['Accepted', 'Declined', 'Pending'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    db.run(
+      `UPDATE Expenses SET mgrStatus = ?, updatedAt = ? WHERE id = ?`,
+      [status, new Date().toISOString(), req.params.id],
+      function (err) {
+        if (err) return res.status(500).json({ error: 'DB error' });
+        db.get(`SELECT * FROM Expenses WHERE id = ?`, [req.params.id], (e2, row) => {
+          if (e2) return res.status(500).json({ error: 'DB error' });
+          res.json(row || {});
+        });
+      }
+    );
+  }
+);
+
+// PATCH /api/expenses/:id/accountant {status: 'Approved'|'Declined'}
+app.patch(
+  '/api/expenses/:id/accountant',
+  auth,
+  requireRole('accountant'),
+  (req, res) => {
+    const { status } = req.body || {};
+    if (!['Approved', 'Declined', 'Pending'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    db.run(
+      `UPDATE Expenses SET acctStatus = ?, updatedAt = ? WHERE id = ?`,
+      [status, new Date().toISOString(), req.params.id],
+      function (err) {
+        if (err) return res.status(500).json({ error: 'DB error' });
+        db.get(`SELECT * FROM Expenses WHERE id = ?`, [req.params.id], (e2, row) => {
+          if (e2) return res.status(500).json({ error: 'DB error' });
+          res.json(row || {});
+        });
+      }
+    );
+  }
+);
+
+/* -------------------------------------------------------
+   OPTIONAL: EXPORT TO GOOGLE SHEETS
+   Set SERVICE_ACCOUNT_JSON (base64 of JSON) and GOOGLE_SHEETS_ID
+------------------------------------------------------- */
+app.get('/api/export/sheets', auth, requireRole('admin'), async (req, res) => {
+  try {
+    const saB64 = process.env.SERVICE_ACCOUNT_JSON || '';
+    const sheetId = process.env.GOOGLE_SHEETS_ID || '';
+    if (!saB64 || !sheetId) {
+      return res.status(400).json({ error: 'Sheets env missing' });
+    }
+
+    const { google } = require('googleapis');
+    const sa = JSON.parse(Buffer.from(saB64, 'base64').toString('utf8'));
+
+    const scopes = ['https://www.googleapis.com/auth/spreadsheets'];
+    const authGoogle = new google.auth.JWT(sa.client_email, null, sa.private_key, scopes);
+    await authGoogle.authorize();
+
+    const sheets = google.sheets({ version: 'v4', auth: authGoogle });
+
+    // Fetch all expenses
+    db.all(
+      `SELECT e.id, u.name as employee, e.title, e.category, e.amount, e.currency,
+              e.date, e.mgrStatus, e.acctStatus, e.paid
+         FROM Expenses e
+         LEFT JOIN Users u ON u.id = e.employeeId
+        ORDER BY datetime(e.createdAt) DESC`,
+      [],
+      async (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error' });
+
+        const values = [
+          ['ID', 'Employee', 'Title', 'Category', 'Amount', 'Currency', 'Date',
+           'Mgr Status', 'Acct Status', 'Paid']
+        ];
+        rows.forEach(r => values.push([
+          r.id, r.employee, r.title, r.category, r.amount, r.currency, r.date,
+          r.mgrStatus, r.acctStatus, r.paid ? 'Yes' : 'No'
+        ]));
+
+        await sheets.spreadsheets.values.clear({
+          spreadsheetId: sheetId,
+          range: 'Sheet1!A1:Z9999'
+        });
+
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: sheetId,
+          range: 'Sheet1!A1',
+          valueInputOption: 'RAW',
+          requestBody: { values }
+        });
+
+        res.json({ message: 'Exported to Google Sheets successfully' });
+      }
+    );
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Sheets export failed' });
+  }
+});
+
+/* -------------------------------------------------------
+   HEALTH
+------------------------------------------------------- */
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+/* -------------------------------------------------------
+   STATIC (serve uploaded files)
+------------------------------------------------------- */
+app.use('/uploads', express.static(UPLOAD_DIR));
+
+/* -------------------------------------------------------
+   START
+------------------------------------------------------- */
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () =>
+  console.log(
+    `Server started on http://localhost:${PORT}\n[CORS] Allowed origins: ${ORIGINS.join(', ')}`
+  )
+);
