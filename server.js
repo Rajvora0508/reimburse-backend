@@ -1,27 +1,34 @@
-// server.js
-// ------------------------------------------------------------
-// Minimal reimbursement backend with proper CORS preflight.
-// - CORS_ORIGINS env var: comma-separated list of allowed origins
-// - JWT auth for /api/** routes
-// - Seeded users: admin/manager/accountant/alice with password: password123
-// ------------------------------------------------------------
+/**
+ * Reimburse backend – Express + SQLite + JWT
+ * ==========================================
+ *  - Login:         POST /api/auth/login  -> { token, user }
+ *  - Current user:  GET  /api/auth/me     -> { user }
+ *  - Expenses:      GET  /api/expenses    -> [ ... ]
+ *  - Health:        GET  /health          -> { ok: true }
+ *
+ * CORS:
+ *  - Set CORS_ORIGINS in env as comma separated list:
+ *      CORS_ORIGINS="https://brown-mouse-202848.hostingersite.com,http://localhost:5500"
+ */
 
-const path = require('path');
-const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
 
-// ------------------------
-// App & middleware
-// ------------------------
 const app = express();
 app.use(express.json());
 
-// ------------------------
-// CORS CONFIG
-// ------------------------
+// ----------------------
+// ENV & constants
+// ----------------------
+const PORT = process.env.PORT || 10000;
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+
+// Allowed origins for CORS, configured via env
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -29,7 +36,7 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
 
 const corsOptions = {
   origin: (origin, cb) => {
-    // Allow server-to-server (no Origin)
+    // Allow server-to-server or curl (no origin)
     if (!origin) return cb(null, true);
     const ok = allowedOrigins.includes(origin);
     cb(ok ? null : new Error('Origin not allowed'), ok);
@@ -40,22 +47,22 @@ const corsOptions = {
   optionsSuccessStatus: 204
 };
 
-// Must be before routes
 app.use(cors(corsOptions));
-// Answer preflight for all routes
 app.options('*', cors(corsOptions));
-
-// Help caches differentiate per-origin
+// Help caches vary per origin
 app.use((req, res, next) => {
   res.header('Vary', 'Origin');
   next();
 });
 
-// ------------------------
-// DB INITIALIZATION
-// ------------------------
-const dbFile = path.join(__dirname, 'database.sqlite');
-const db = new sqlite3.Database(dbFile);
+// ----------------------
+// SQLite setup
+// ----------------------
+const DB_FILE = path.join(__dirname, 'database.sqlite');
+if (!fs.existsSync(DB_FILE)) {
+  fs.closeSync(fs.openSync(DB_FILE, 'w'));
+}
+const db = new sqlite3.Database(DB_FILE);
 
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -65,19 +72,21 @@ function run(sql, params = []) {
     });
   });
 }
-function get(sql, params = []) {
+
+function all(sql, params = []) {
   return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
+    db.all(sql, params, function (err, rows) {
       if (err) reject(err);
-      else resolve(row);
+      else resolve(rows);
     });
   });
 }
-function all(sql, params = []) {
+
+function get(sql, params = []) {
   return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
+    db.get(sql, params, function (err, row) {
       if (err) reject(err);
-      else resolve(rows);
+      else resolve(row);
     });
   });
 }
@@ -102,75 +111,71 @@ async function initDb() {
       amount REAL,
       currency TEXT,
       date TEXT,
-      entryDate TEXT,
+      employeeId TEXT,
       note TEXT,
-      mgrStatus TEXT DEFAULT 'Pending',
-      acctStatus TEXT DEFAULT 'Pending',
-      paid INTEGER DEFAULT 0,
       receiptPath TEXT,
       receiptName TEXT,
       receiptMime TEXT,
-      employeeId TEXT,
-      createdAt TEXT,
-      updatedAt TEXT
+      mgrStatus TEXT DEFAULT 'Pending',
+      acctStatus TEXT DEFAULT 'Pending',
+      paid INTEGER DEFAULT 0,
+      createdAt TEXT DEFAULT (datetime('now')),
+      updatedAt TEXT DEFAULT (datetime('now'))
     )
   `);
 
-  // Seed default users if not present
-  const u = await all(`SELECT name FROM Users`);
-  if (!u || u.length === 0) {
+  // Seed users if not exists
+  const count = await get(`SELECT COUNT(*) as c FROM Users`);
+  if (!count || count.c === 0) {
     const users = [
-      { id: cryptoId(), name: 'admin',      password: 'password123', role: 'admin',      email: 'admin@company.local' },
-      { id: cryptoId(), name: 'manager',    password: 'password123', role: 'manager',    email: 'mgr@company.local' },
-      { id: cryptoId(), name: 'accountant', password: 'password123', role: 'accountant', email: 'acct@company.local' },
-      { id: cryptoId(), name: 'alice',      password: 'password123', role: 'employee',   email: 'alice@company.local' }
+      { id: crypto.randomUUID(), name: 'admin',      password: 'password123', role: 'admin',      email: 'admin@company.local' },
+      { id: crypto.randomUUID(), name: 'manager',    password: 'password123', role: 'manager',    email: 'manager@company.local' },
+      { id: crypto.randomUUID(), name: 'accountant', password: 'password123', role: 'accountant', email: 'accountant@company.local' },
+      { id: crypto.randomUUID(), name: 'alice',      password: 'password123', role: 'employee',   email: 'alice@company.local' }
     ];
-    for (const usr of users) {
+    for (const u of users) {
       await run(
-        `INSERT INTO Users (id, name, password, role, email) VALUES (?,?,?,?,?)`,
-        [usr.id, usr.name, usr.password, usr.role, usr.email]
+        `INSERT INTO Users (id, name, password, role, email) VALUES (?, ?, ?, ?, ?)`,
+        [u.id, u.name, u.password, u.role, u.email]
       );
     }
-    console.log(`Seeded users: admin/manager/accountant/alice with password: password123`);
+    console.log('Seeded users: admin/manager/accountant/alice with password: password123');
   }
 }
-function cryptoId() {
-  return [...crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx']
-    ? crypto.randomUUID()
-    : 'id-' + Math.random().toString(36).slice(2);
+
+// ----------------------
+// Auth helpers
+// ----------------------
+function signToken(user) {
+  // NEVER put the password inside token
+  const payload = {
+    user: {
+      id: user.id,
+      name: user.name,
+      role: user.role,
+      email: user.email
+    }
+  };
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 }
 
-// Node 18+ has global crypto; fallback
-const crypto = globalThis.crypto || require('crypto').webcrypto;
-
-// ------------------------
-// AUTH MIDDLEWARE
-// ------------------------
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-
 function authRequired(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing token' });
+  const auth = req.headers.authorization || '';
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return res.status(401).json({ error: 'Missing or malformed Authorization header' });
+
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload; // { id, name, role }
+    const payload = jwt.verify(m[1], JWT_SECRET);
+    req.user = payload.user || payload;
     next();
   } catch (e) {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
-function requireRole(roles = []) {
-  return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-    if (roles.length === 0 || roles.includes(req.user.role)) return next();
-    return res.status(403).json({ error: 'Forbidden' });
-  };
-}
 
-// ------------------------
-// ROUTES
-// ------------------------
+// ----------------------
+// Routes
+// ----------------------
 
 // Health
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -179,150 +184,70 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { name, password } = req.body || {};
+    if (!name || !password) {
+      return res.status(400).json({ error: 'name and password are required' });
+    }
     const user = await get(`SELECT * FROM Users WHERE name = ?`, [name]);
-    if (!user || user.password !== password) {
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    // Plain-text passwords only for demo (DO NOT use in production)
+    if (user.password !== password) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    const token = jwt.sign(
-      { id: user.id, name: user.name, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-    res.json({
+    const token = signToken(user);
+    return res.json({
       token,
       user: { id: user.id, name: user.name, role: user.role, email: user.email }
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Auth failed' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Login failed' });
   }
 });
 
-// Get expenses
+// Current user
+app.get('/api/auth/me', authRequired, (req, res) => {
+  res.json({ user: req.user });
+});
+
+// Expenses list
+// - admin/manager/accountant: all expenses
+// - employee: only own expenses
 app.get('/api/expenses', authRequired, async (req, res) => {
   try {
     const role = req.user.role;
+    let rows;
     if (role === 'employee') {
-      const rows = await all(
-        `SELECT e.*, u.name as employeeName, u.email as employeeEmail
-         FROM Expenses e
+      rows = await all(
+        `SELECT e.*, u.name as employeeName FROM Expenses e
          LEFT JOIN Users u ON u.id = e.employeeId
-         WHERE employeeId = ?
-         ORDER BY datetime(createdAt) DESC`,
+         WHERE employeeId = ? ORDER BY createdAt DESC`,
         [req.user.id]
       );
-      return res.json(rows);
     } else {
-      const rows = await all(
-        `SELECT e.*, u.name as employeeName, u.email as employeeEmail
-         FROM Expenses e
+      rows = await all(
+        `SELECT e.*, u.name as employeeName FROM Expenses e
          LEFT JOIN Users u ON u.id = e.employeeId
-         ORDER BY datetime(createdAt) DESC`
+         ORDER BY createdAt DESC`
       );
-      return res.json(rows);
     }
-  } catch (err) {
-    console.error(err);
+    res.json(rows || []);
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Failed to fetch expenses' });
   }
 });
 
-// Create expense (employee)
-app.post('/api/expenses', authRequired, requireRole(['employee', 'admin']), async (req, res) => {
-  try {
-    const {
-      title = '',
-      category = '',
-      amount = 0,
-      currency = 'INR',
-      date = new Date().toISOString().slice(0, 10),
-      note = ''
-    } = req.body || {};
-    const now = new Date().toISOString();
-    const id = cryptoId();
-
-    await run(
-      `INSERT INTO Expenses
-       (id, title, category, amount, currency, date, entryDate, note,
-        mgrStatus, acctStatus, paid, receiptPath, receiptName, receiptMime,
-        employeeId, createdAt, updatedAt)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [
-        id, title, category, amount, currency, date, null, note,
-        'Pending', 'Pending', 0, null, null, null,
-        req.user.id, now, now
-      ]
-    );
-
-    const row = await get(`SELECT * FROM Expenses WHERE id = ?`, [id]);
-    res.json(row);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Create failed' });
-  }
+// Return JSON 404 for unknown API routes
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'Not found' });
 });
 
-// Manager decision
-app.patch('/api/expenses/:id/mgr', authRequired, requireRole(['manager', 'admin']), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { decision } = req.body; // 'Accepted' or 'Declined'
-    const exp = await get(`SELECT * FROM Expenses WHERE id = ?`, [id]);
-    if (!exp) return res.status(404).json({ error: 'Not found' });
-
-    const mgrStatus = (decision === 'Accepted') ? 'Accepted' : 'Declined';
-    const now = new Date().toISOString();
-
-    await run(
-      `UPDATE Expenses SET mgrStatus = ?, updatedAt = ? WHERE id = ?`,
-      [mgrStatus, now, id]
-    );
-
-    const updated = await get(`SELECT * FROM Expenses WHERE id = ?`, [id]);
-    res.json(updated);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Manager decision failed' });
-  }
-});
-
-// Accountant decision
-app.patch('/api/expenses/:id/acct', authRequired, requireRole(['accountant', 'admin']), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { decision } = req.body; // 'Approved' or 'Declined'
-    const exp = await get(`SELECT * FROM Expenses WHERE id = ?`, [id]);
-    if (!exp) return res.status(404).json({ error: 'Not found' });
-
-    // If manager declined, accountant cannot approve
-    if (exp.mgrStatus === 'Declined' && decision === 'Approved') {
-      return res.status(400).json({ error: 'Manager declined; cannot approve' });
-    }
-
-    const acctStatus = (decision === 'Approved') ? 'Approved' : 'Declined';
-    const now = new Date().toISOString();
-
-    await run(
-      `UPDATE Expenses SET acctStatus = ?, updatedAt = ? WHERE id = ?`,
-      [acctStatus, now, id]
-    );
-
-    const updated = await get(`SELECT * FROM Expenses WHERE id = ?`, [id]);
-    res.json(updated);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Accountant decision failed' });
-  }
-});
-
-// ------------------------
-// START SERVER
-// ------------------------
-(async () => {
-  await initDb();
-
-  const PORT = process.env.PORT || 10000;
+// ----------------------
+// Start
+// ----------------------
+initDb().then(() => {
   app.listen(PORT, () => {
     console.log(`Server started on http://localhost:${PORT}`);
+    console.log('Available at your primary URL on Render.');
   });
-})();
+});
